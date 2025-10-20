@@ -1,0 +1,554 @@
+═══════════════════════════════════════════════════════════════════════════════
+        BPRED2BIT STEP-BY-STEP EXAMPLE: STRUCTURES AND POINTER FLOW
+═══════════════════════════════════════════════════════════════════════════════
+
+SCENARIO: Tracking ONE branch at address 0x00401000 through two iterations
+
+═══════════════════════════════════════════════════════════════════════════════
+PHASE 0: INITIALIZATION
+═══════════════════════════════════════════════════════════════════════════════
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Call: bpred_create(BPred2bit, 4096, 0, 0, 0, 0, 0, 2048, 1, 8)          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+Step 1: Allocate main predictor structure
+┌─────────────────────────────────────────┐
+│  struct bpred_t *pred                   │
+│  Address: 0x7fff0000                    │
+│                                         │
+│  .class = BPred2bit                     │
+│  .dirpred.bimod = NULL     ←── Fill next│
+│  .dirpred.twolev = NULL                 │
+│  .dirpred.meta = NULL                   │
+│  .btb.btb_data = NULL      ←── Fill later│
+│  .retstack.stack = NULL    ←── Fill later│
+│  .lookups = 0                           │
+│  .dir_hits = 0                          │
+│  .misses = 0                            │
+└─────────────────────────────────────────┘
+
+Step 2: Call bpred_dir_create(BPred2bit, 4096, ...)
+┌─────────────────────────────────────────┐
+│  struct bpred_dir_t *pred_dir           │
+│  Address: 0x7fff1000                    │
+│                                         │
+│  .class = BPred2bit                     │
+│  .config.bimod.size = 4096              │
+│  .config.bimod.table = NULL ←── Allocate│
+└─────────────────────────────────────────┘
+
+Step 3: Allocate counter table
+┌─────────────────────────────────────────────────────────────────────┐
+│  unsigned char *table = calloc(4096, 1)                            │
+│  Address: 0x7fff2000                                               │
+│                                                                     │
+│  Initialized with alternating pattern:                             │
+│  [0]=1, [1]=2, [2]=1, [3]=2, [4]=1, [5]=2, ...                     │
+│                                                                     │
+│  Our branch will use: [1056] = 2  (Weakly Taken)                   │
+│                         ↑                                           │
+│                         └── Address: 0x7fff2420                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+Step 4: Link structures together
+┌─────────────────────────────────────────┐
+│  pred (0x7fff0000)                      │
+│    │                                    │
+│    └─> .dirpred.bimod = 0x7fff1000 ────┼──→ ┌─────────────────────────┐
+│                                         │    │ pred_dir (0x7fff1000)   │
+│    ┌────────────────────────────────────┘    │   │                     │
+│    │                                         │   └─> .config.bimod.    │
+│    │                                         │       table = 0x7fff2000│
+│    │                                         │             │           │
+│    │                                         └─────────────┼───────────┘
+│    │                                                       │
+│    │                                                       ▼
+│    │                                         ┌──────────────────────────┐
+│    │                                         │ table[] (0x7fff2000)     │
+│    │                                         │                          │
+│    │                                         │ [0]    = 1               │
+│    │                                         │ [1]    = 2               │
+│    │                                         │ ...                      │
+│    │                                         │ [1056] = 2  ◄── Our slot │
+│    │                                         │ ...                      │
+│    │                                         │ [4095] = 2               │
+│    │                                         └──────────────────────────┘
+│    │
+│    └─> Also allocate:
+│        - BTB array at 0x7fff3000 (2048 entries)
+│        - RAS array at 0x7fff4000 (8 entries)
+└─────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+ITERATION 1: FIRST ENCOUNTER WITH BRANCH
+═══════════════════════════════════════════════════════════════════════════════
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CYCLE 100: Fetch stage encounters branch at PC = 0x00401000             │
+└──────────────────────────────────────────────────────────────────────────┘
+
+STEP 1.1: Call bpred_lookup()
+─────────────────────────────
+Input Parameters:
+  • pred      = 0x7fff0000
+  • baddr     = 0x00401000
+  • btarget   = 0
+  • op        = MD_BEQ (conditional branch)
+  • is_call   = FALSE
+  • is_return = FALSE
+  • dir_update_ptr = 0x7ffff000 (stack variable)
+  • stack_recover_idx = (output parameter)
+
+
+STEP 1.2: Initialize dir_update_ptr
+────────────────────────────────────
+┌─────────────────────────────────────────┐
+│ dir_update_ptr (0x7ffff000)             │
+│                                         │
+│ .pdir1 = NULL    ←── Will be filled    │
+│ .pdir2 = NULL                           │
+│ .pmeta = NULL                           │
+│ .dir.ras    = 0                         │
+│ .dir.bimod  = 0                         │
+│ .dir.twolev = 0                         │
+│ .dir.meta   = 0                         │
+└─────────────────────────────────────────┘
+
+
+STEP 1.3: Direction Predictor Lookup - Call bpred_dir_lookup()
+───────────────────────────────────────────────────────────────
+┌────────────────────────────────────────────────────────────────┐
+│ bpred_dir_lookup(pred->dirpred.bimod, 0x00401000)             │
+│                  ↑                      ↑                      │
+│              0x7fff1000            0x00401000                  │
+└────────────────────────────────────────────────────────────────┘
+
+Hash Calculation:
+  baddr = 0x00401000
+  Step 1: baddr >> 19    = 0x00000020
+  Step 2: baddr >> 2     = 0x00100400
+  Step 3: XOR            = 0x00100420
+  Step 4: Mask (& 0xFFF) = 0x00000420 = 1056 (decimal)
+
+Access Table:
+┌──────────────────────────────────────────────────┐
+│ index = 1056                                     │
+│ pointer = &table[1056]                           │
+│         = 0x7fff2000 + 1056                      │
+│         = 0x7fff2420                             │
+│                                                  │
+│ Read value: *(0x7fff2420) = 2                    │
+└──────────────────────────────────────────────────┘
+
+Return: 0x7fff2420 (pointer to counter)
+
+
+STEP 1.4: Back in bpred_lookup() - Store Pointer
+─────────────────────────────────────────────────
+┌─────────────────────────────────────────────┐
+│ dir_update_ptr (0x7ffff000)                 │
+│                                             │
+│ .pdir1 = 0x7fff2420  ◄── SAVED!            │
+│           │                                 │
+│           └─────────────┐                   │
+│                         │                   │
+│ .pdir2 = NULL           │                   │
+│ .pmeta = NULL           │                   │
+└─────────────────────────┼───────────────────┘
+                          │
+                          ▼
+        ┌──────────────────────────────────┐
+        │ table[1056] (0x7fff2420)         │
+        │ Current value: 2 (Weakly Taken)  │
+        └──────────────────────────────────┘
+
+
+STEP 1.5: BTB (Branch Target Buffer) Lookup
+────────────────────────────────────────────
+BTB Index Calculation:
+  index = (0x00401000 >> 2) & (2048 - 1)
+        = 0x00100400 & 0x7FF
+        = 0x400 = 1024
+
+Check BTB Entry:
+┌────────────────────────────────────────────────┐
+│ btb_entry = &pred->btb.btb_data[1024]         │
+│           = 0x7fff3000 + (1024 * 32)          │
+│           = 0x7fff3000 + 0x8000               │
+│           = 0x7fffb000                        │
+│                                               │
+│ btb_entry->addr = 0x00000000 (empty)          │
+│                                               │
+│ Compare: 0x00000000 != 0x00401000             │
+│ Result: BTB MISS!                             │
+│ pbtb = NULL                                   │
+└────────────────────────────────────────────────┘
+
+
+STEP 1.6: Generate Prediction
+──────────────────────────────
+Conditional Branch + BTB Miss:
+┌─────────────────────────────────────────────────┐
+│ Read counter through saved pointer:             │
+│   *dir_update_ptr->pdir1 = *(0x7fff2420) = 2    │
+│                                                 │
+│ Check: 2 >= 2 ? YES → Predict TAKEN            │
+│                                                 │
+│ But BTB miss, so no target address known       │
+│                                                 │
+│ Return: 1 (means taken but target unknown)     │
+└─────────────────────────────────────────────────┘
+
+Back in ruu_fetch():
+  fetch_pred_PC = 1
+  pred->lookups++ (now = 1)
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CYCLE 105: Decode stage - Store dir_update_ptr in instruction          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+The dir_update_ptr is copied into the RUU (reorder buffer) entry:
+┌─────────────────────────────────────────────────────┐
+│ RUU[tail] = {                                       │
+│   .PC = 0x00401000                                  │
+│   .op = MD_BEQ                                      │
+│   .dir_update.pdir1 = 0x7fff2420  ◄── PRESERVED    │
+│   .dir_update.pdir2 = NULL                          │
+│   .dir_update.pmeta = NULL                          │
+│   ...                                               │
+│ }                                                   │
+└─────────────────────────────────────────────────────┘
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CYCLE 110: Execute stage - Branch resolves                              │
+└──────────────────────────────────────────────────────────────────────────┘
+
+Actual outcome:
+  • Condition evaluated: taken = TRUE
+  • Target computed: actual_target = 0x00401100
+  • Compare: predicted taken=TRUE, actual taken=TRUE ✓
+  • But address wrong (BTB miss) ✗
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CYCLE 115: Commit stage - Update predictor                              │
+└──────────────────────────────────────────────────────────────────────────┘
+
+STEP 1.7: Call bpred_update()
+──────────────────────────────
+Input Parameters:
+  • pred        = 0x7fff0000
+  • baddr       = 0x00401000
+  • btarget     = 0x00401100
+  • taken       = TRUE (1)
+  • pred_taken  = TRUE (1)
+  • correct     = FALSE (0) - BTB miss
+  • op          = MD_BEQ
+  • dir_update_ptr = &RUU[head].dir_update
+                     (contains pdir1 = 0x7fff2420)
+
+
+STEP 1.8: Update Statistics
+────────────────────────────
+┌─────────────────────────────────────────────┐
+│ if (correct): addr_hits++                   │
+│   → correct=FALSE, skip                     │
+│                                             │
+│ if (!!pred_taken == !!taken): dir_hits++    │
+│   → !!1 == !!1 → TRUE                       │
+│   → dir_hits++ (now = 1)                    │
+│   → Direction was correct! ✓                │
+└─────────────────────────────────────────────┘
+
+
+STEP 1.9: Update Direction Counter
+───────────────────────────────────
+Use the SAVED pointer from lookup:
+┌──────────────────────────────────────────────────┐
+│ Retrieve saved pointer:                          │
+│   dir_update_ptr->pdir1 = 0x7fff2420             │
+│                            │                     │
+│ Current value at pointer:  │                     │
+│   *(0x7fff2420) = 2        │                     │
+│                            ▼                     │
+│                  ┌─────────────────────┐         │
+│                  │ table[1056]         │         │
+│                  │ Before: 2           │         │
+│                  │                     │         │
+│ Update logic:    │ taken=TRUE, so:     │         │
+│   if (taken):    │   if (2 < 3):       │         │
+│     ++counter    │     counter++       │         │
+│                  │                     │         │
+│                  │ After: 3            │         │
+│                  └─────────────────────┘         │
+└──────────────────────────────────────────────────┘
+
+Memory Change:
+  0x7fff2420: [2] → [3]  ✓
+
+
+STEP 1.10: Update BTB
+─────────────────────
+Branch was taken, so allocate/update BTB entry:
+┌────────────────────────────────────────────────┐
+│ Index: 1024 (computed same as lookup)         │
+│ Entry: &pred->btb.btb_data[1024]              │
+│                                               │
+│ Before:                                       │
+│   .addr   = 0x00000000 (empty)                │
+│   .target = 0x00000000                        │
+│                                               │
+│ After:                                        │
+│   .addr   = 0x00401000  ◄── Branch address   │
+│   .op     = MD_BEQ                            │
+│   .target = 0x00401100  ◄── Target address   │
+└────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+ITERATION 2: SECOND ENCOUNTER (Loop back)
+═══════════════════════════════════════════════════════════════════════════════
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CYCLE 200: Fetch stage encounters SAME branch again                     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+STEP 2.1: Call bpred_lookup() again
+────────────────────────────────────
+Same inputs: baddr = 0x00401000, etc.
+
+
+STEP 2.2: Direction Predictor Lookup
+─────────────────────────────────────
+Same hash calculation: index = 1056
+Same pointer: 0x7fff2420
+
+BUT NOW:
+┌──────────────────────────────────────────────────┐
+│ Read value: *(0x7fff2420) = 3  ◄── UPDATED!     │
+│                                                  │
+│ Counter changed from 2 → 3                       │
+│ (Weakly Taken → Strongly Taken)                  │
+└──────────────────────────────────────────────────┘
+
+
+STEP 2.3: BTB Lookup
+─────────────────────
+Same index: 1024
+
+NOW BTB HAS ENTRY:
+┌────────────────────────────────────────────────┐
+│ btb_entry = &pred->btb.btb_data[1024]         │
+│                                               │
+│ Check: btb_entry->addr == 0x00401000          │
+│        0x00401000 == 0x00401000  ✓            │
+│                                               │
+│ BTB HIT!                                      │
+│ pbtb = 0x7fffb000 (valid pointer)             │
+│ pbtb->target = 0x00401100                     │
+└────────────────────────────────────────────────┘
+
+
+STEP 2.4: Generate Prediction
+──────────────────────────────
+Conditional Branch + BTB Hit:
+┌─────────────────────────────────────────────────┐
+│ Read counter: *pdir1 = 3                        │
+│                                                 │
+│ Check: 3 >= 2 ? YES → Predict TAKEN            │
+│                                                 │
+│ BTB hit, so return target:                      │
+│   return pbtb->target = 0x00401100              │
+│                                                 │
+│ Result: Complete prediction! ✓✓                │
+└─────────────────────────────────────────────────┘
+
+Back in ruu_fetch():
+  fetch_pred_PC = 0x00401100  ← Correct target!
+  Fetch continues from correct address
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CYCLE 210: Execute stage                                                │
+└──────────────────────────────────────────────────────────────────────────┘
+
+Actual outcome:
+  • taken = TRUE
+  • actual_target = 0x00401100
+  • Compare: predicted=0x00401100, actual=0x00401100
+  • PERFECT PREDICTION! ✓✓✓
+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CYCLE 215: Commit stage                                                 │
+└──────────────────────────────────────────────────────────────────────────┘
+
+STEP 2.5: Call bpred_update()
+──────────────────────────────
+  • correct = TRUE (both direction and target correct)
+  • pred->addr_hits++ (now = 1)
+  • pred->dir_hits++ (now = 2)
+
+
+STEP 2.6: Update Counter
+────────────────────────
+┌──────────────────────────────────────────────────┐
+│ Pointer: dir_update_ptr->pdir1 = 0x7fff2420      │
+│                                                  │
+│ Current value: *(0x7fff2420) = 3                 │
+│                                                  │
+│ Update logic:                                    │
+│   taken=TRUE, so:                                │
+│   if (3 < 3): counter++  → FALSE, already at max │
+│                                                  │
+│ Value stays: 3 (Strongly Taken)                  │
+└──────────────────────────────────────────────────┘
+
+
+STEP 2.7: BTB Update
+────────────────────
+Entry already exists and target is correct, no change needed.
+
+═══════════════════════════════════════════════════════════════════════════════
+FINAL STATE SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+
+After 2 iterations:
+
+┌────────────────────────────────────────┐
+│ DIRECTION PREDICTOR                    │
+├────────────────────────────────────────┤
+│ table[1056] (0x7fff2420)               │
+│   Initial:  2 (Weakly Taken)           │
+│   After 1:  3 (Strongly Taken)         │
+│   After 2:  3 (Strongly Taken)         │
+└────────────────────────────────────────┘
+
+┌────────────────────────────────────────┐
+│ BTB (Branch Target Buffer)             │
+├────────────────────────────────────────┤
+│ btb_data[1024] (0x7fffb000)            │
+│   .addr   = 0x00401000                 │
+│   .target = 0x00401100                 │
+│   .op     = MD_BEQ                     │
+└────────────────────────────────────────┘
+
+┌────────────────────────────────────────┐
+│ STATISTICS                             │
+├────────────────────────────────────────┤
+│ lookups    = 2                         │
+│ addr_hits  = 1 (50% - BTB miss on 1st) │
+│ dir_hits   = 2 (100% - both correct)   │
+│ misses     = 0                         │
+└────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+KEY POINTER INSIGHTS
+═══════════════════════════════════════════════════════════════════════════════
+
+The MAGIC of dir_update_ptr->pdir1:
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  FETCH Stage (Cycle 100)            COMMIT Stage (Cycle 115)           │
+│  ─────────────────────              ──────────────────────             │
+│                                                                         │
+│  bpred_lookup()                     bpred_update()                     │
+│       │                                    │                           │
+│       ├─ Compute hash: 1056               │                           │
+│       ├─ Get pointer: 0x7fff2420           │                           │
+│       └─ SAVE in dir_update_ptr ───────────┼──────────┐                │
+│                                            │          │                │
+│                                            ▼          ▼                │
+│                                       USE saved pointer                │
+│                                       to update SAME counter           │
+│                                                                         │
+│  No need to recompute hash!                                            │
+│  Pointer bridges 15-cycle gap!                                         │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Why this works:
+  1. Table memory is STABLE (never reallocated)
+  2. Pointer is stored IN the instruction's RUU entry
+  3. RUU entry travels with instruction through pipeline
+  4. When instruction commits, pointer is still valid
+  5. Direct memory access - no need to recompute anything!
+
+═══════════════════════════════════════════════════════════════════════════════
+MEMORY MAP VISUALIZATION
+═══════════════════════════════════════════════════════════════════════════════
+
+                                         HIGH MEMORY
+                                              ▲
+                                              │
+    ┌─────────────────────────────────────────┼────────────────┐
+    │                                         │                │
+    │  0x7ffff000  dir_update_ptr (temporary) │                │
+    │              [Stack variable]            │                │
+    │              .pdir1 ────────────────────┼───────┐        │
+    │                                         │       │        │
+    ├─────────────────────────────────────────┤       │        │
+    │                                                 │        │
+    │  0x7fff4000  RAS (Return Addr Stack)           │        │
+    │              [8 entries × 16 bytes]             │        │
+    │                                                 │        │
+    ├─────────────────────────────────────────────────┤        │
+    │                                                 │        │
+    │  0x7fff3000  BTB (Branch Target Buffer)        │        │
+    │              [2048 entries × 32 bytes]          │        │
+    │              ...                                │        │
+    │              [1024] ← Our entry                 │        │
+    │              ...                                │        │
+    │                                                 │        │
+    ├─────────────────────────────────────────────────┤        │
+    │                                                 │        │
+    │  0x7fff2000  Bimodal Table                      │        │
+    │              [4096 bytes]                       │        │
+    │              [0] = 1                            │        │
+    │              [1] = 2                            │        │
+    │              ...                                │        │
+    │              [1056] = 3  ◄──────────────────────┼────────┘
+    │              ...         ↑                      │
+    │              [4095] = 2  │                      │
+    │                          │                      │
+    │              Address: 0x7fff2420                │
+    │                          │                      │
+    ├──────────────────────────┼──────────────────────┤
+    │                          │                      │
+    │  0x7fff1000  pred_dir    │                      │
+    │              [24 bytes]  │                      │
+    │              .config.bimod.table ────────────→  │
+    │                                                 │
+    ├─────────────────────────────────────────────────┤
+    │                                                 │
+    │  0x7fff0000  pred (main predictor)             │
+    │              [128 bytes]                        │
+    │              .dirpred.bimod ──────────────→     │
+    │              .btb.btb_data ───────────→         │
+    │              .retstack.stack ─────────→         │
+    │                                                 │
+    └─────────────────────────────────────────────────┘
+                                              │
+                                              ▼
+                                         LOW MEMORY
+
+═══════════════════════════════════════════════════════════════════════════════
+END OF WALKTHROUGH
+═══════════════════════════════════════════════════════════════════════════════
+
+Now you understand:
+  ✓ How structures are allocated and linked
+  ✓ How hash functions compute table indices
+  ✓ How pointers save exact memory locations
+  ✓ How pointers bridge fetch-to-commit gap
+  ✓ How counters are updated using saved pointers
+  ✓ How BTB works alongside direction prediction
+  ✓ The complete lifecycle of one branch prediction
+
+This same pattern applies to ALL predictor types - just with different:
+  • Hash functions
+  • Table structures
+  • Update algorithms

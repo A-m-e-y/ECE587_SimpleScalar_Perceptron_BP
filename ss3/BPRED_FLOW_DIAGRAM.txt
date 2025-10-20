@@ -1,0 +1,355 @@
+================================================================================
+                    BRANCH PREDICTOR EXECUTION FLOW
+================================================================================
+
+INITIALIZATION PHASE (Once at startup)
+======================================
+
+    main() [sim-outorder.c]
+         |
+         v
+    bpred_create(BPredNeil, sizes...)  [bpred.c]
+         |
+         +---> Allocate main bpred_t structure
+         |
+         +---> switch(BPredNeil):
+         |         |
+         |         +---> Create direction predictor(s)
+         |         |     - Call bpred_dir_create()
+         |         |     - Allocate tables (bimod, 2lev, meta, or custom)
+         |         |     - Initialize counters
+         |         |
+         |         +---> Allocate BTB
+         |         |     - btb_data[] array
+         |         |     - Setup LRU chains
+         |         |
+         |         +---> Allocate RAS
+         |               - stack[] array
+         |               - tos = size - 1
+         |
+         v
+    Predictor ready for use
+
+
+PREDICTION PHASE (Every branch in FETCH stage)
+===============================================
+
+    ruu_fetch() [sim-outorder.c, line 4168]
+         |
+         | For each instruction fetched:
+         |
+         +---> Is it a control instruction? (MD_OP_FLAGS(op) & F_CTRL)
+                   |
+                   | YES
+                   v
+              bpred_lookup(pred, baddr, btarget, op, ...)  [bpred.c, line 558]
+                   |
+                   +---> [1] Direction Prediction
+                   |         |
+                   |         v
+                   |     switch(pred->class):
+                   |         |
+                   |         +---> case BPredNeil:
+                   |         |         |
+                   |         |         v
+                   |         |     bpred_dir_lookup(pred->dirpred.XXX, baddr)
+                   |         |         |
+                   |         |         +---> YOUR CUSTOM LOGIC HERE
+                   |         |         |     - Hash address
+                   |         |         |     - Access custom table
+                   |         |         |     - Return pointer to counter
+                   |         |         |
+                   |         |         v
+                   |         |     Store pointer in dir_update_ptr->pdir1
+                   |         |     (will be used later for update)
+                   |         |
+                   |         +---> case BPredComb:
+                   |         |         - Query bimodal
+                   |         |         - Query 2-level
+                   |         |         - Query meta (chooses between them)
+                   |         |         - Store all 3 pointers
+                   |         |
+                   |         +---> case BPred2Level:
+                   |         |         - Query 2-level only
+                   |         |
+                   |         +---> case BPred2bit:
+                   |                   - Query bimodal only
+                   |
+                   +---> [2] Return Address Stack (RAS)
+                   |         |
+                   |         +---> if (is_return):
+                   |         |         - Pop from RAS
+                   |         |         - return target from stack
+                   |         |
+                   |         +---> if (is_call):
+                   |                   - Push return addr to RAS
+                   |
+                   +---> [3] Branch Target Buffer (BTB) Lookup
+                   |         |
+                   |         +---> Hash branch address
+                   |         +---> Search BTB set for matching entry
+                   |         +---> if (found):
+                   |                   pbtb = &btb_entry
+                   |
+                   +---> [4] Generate Prediction
+                   |         |
+                   |         +---> if (unconditional jump):
+                   |         |         return pbtb->target or 1
+                   |         |
+                   |         +---> if (conditional branch):
+                   |         |         |
+                   |         |         +---> Read counter: *dir_update_ptr->pdir1
+                   |         |         |
+                   |         |         +---> if (counter >= 2):  // TAKEN
+                   |         |         |         if (pbtb):
+                   |         |         |             return pbtb->target
+                   |         |         |         else:
+                   |         |         |             return 1 (taken, no target)
+                   |         |         |
+                   |         |         +---> else:  // NOT TAKEN
+                   |         |                   return 0
+                   |
+                   v
+              Return predicted next PC
+                   |
+                   v
+         Update fetch_pred_PC
+         Continue fetching...
+
+
+EXECUTION PHASE (Branch executes in EX stage)
+==============================================
+
+    Instruction executes
+         |
+         v
+    Branch resolves
+         |
+         +---> actual_target determined
+         +---> taken = TRUE or FALSE
+         |
+         v
+    Compare with prediction
+         |
+         +---> correct = (pred_PC == actual_next_PC)
+         +---> pred_taken = (pred_PC != PC + 4)
+         |
+         v
+    if (MISPREDICTION):
+         |
+         +---> ruu_recover(rs)
+         +---> bpred_recover(pred, baddr, stack_recover_idx)
+         |         |
+         |         +---> Restore RAS to pre-speculation state
+         |         +---> pred->retstack.tos = stack_recover_idx
+         |
+         +---> Flush pipeline
+         +---> Restart fetch from correct PC
+
+
+UPDATE PHASE (Happens in ID, WB, or COMMIT stage)
+==================================================
+
+    ruu_commit() OR ruu_writeback() OR ruu_dispatch()
+         |
+         | [Based on bpred_spec_update setting]
+         |
+         v
+    bpred_update(pred, baddr, btarget, taken, pred_taken, correct, ...)
+         |
+         +---> [1] Update Statistics
+         |         |
+         |         +---> if (correct): addr_hits++
+         |         +---> if (dir_correct): dir_hits++
+         |         +---> else: misses++
+         |         +---> Update used_bimod, used_2lev, etc.
+         |
+         +---> [2] Update History Registers (for 2-level/custom)
+         |         |
+         |         +---> if (BPredNeil or BPred2Level or BPredComb):
+         |                   |
+         |                   +---> Get L1 index from address
+         |                   +---> shift_reg = (old_history << 1) | taken
+         |                   +---> Store back: shiftregs[l1index] = shift_reg
+         |                   |
+         |                   +---> YOUR CUSTOM UPDATE:
+         |                         - Update global/local history
+         |                         - Update custom tables
+         |
+         +---> [3] Update Direction Counters
+         |         |
+         |         +---> Update primary predictor (pdir1):
+         |         |         |
+         |         |         +---> if (taken):
+         |         |         |         if (counter < 3): counter++
+         |         |         |
+         |         |         +---> else (not taken):
+         |         |                   if (counter > 0): counter--
+         |         |
+         |         +---> Update secondary predictor (pdir2) if exists
+         |         |     [Same saturating counter logic]
+         |         |
+         |         +---> Update meta predictor (pmeta) if exists:
+         |                   |
+         |                   +---> if (bimod != twolev):  // They disagreed
+         |                         |
+         |                         +---> if (twolev was correct):
+         |                         |         meta++  // Favor 2-level
+         |                         |
+         |                         +---> else (bimod was correct):
+         |                                   meta--  // Favor bimodal
+         |
+         +---> [4] Update BTB (only if taken)
+                   |
+                   +---> if (branch was taken):
+                         |
+                         +---> Find BTB entry (or LRU victim)
+                         |
+                         +---> if (entry exists && addr matches):
+                         |         if (!correct):
+                         |             entry->target = btarget
+                         |
+                         +---> else (allocate new):
+                               entry->addr = baddr
+                               entry->target = btarget
+                               entry->op = op
+                               Update LRU chain
+
+
+================================================================================
+                    2-BIT SATURATING COUNTER STATE MACHINE
+================================================================================
+
+                    NOT TAKEN           |           TAKEN
+                    Prediction          |           Prediction
+                                       |
+        0 (Strongly NT) <----+         |         +----> 2 (Weakly T)
+                ^            |         |         |            ^
+                |            |         |         |            |
+            not taken    not taken     |     taken        taken
+                |            |         |         |            |
+                v            |         |         |            v
+        1 (Weakly NT)  <-----+         |         +-----> 3 (Strongly T)
+                                       |
+    -----------------------------------|-----------------------------------
+                                       |
+    Initial state: Alternate between 1 and 2 (weakly not-taken/taken)
+    
+    Update rule:
+        if (branch_taken):
+            if (counter < 3): counter++
+        else:
+            if (counter > 0): counter--
+    
+    Prediction rule:
+        if (counter >= 2): predict TAKEN
+        else:               predict NOT TAKEN
+
+
+================================================================================
+                    BPREDCOMB (COMBINED PREDICTOR) STRUCTURE
+================================================================================
+
+    Branch Address
+         |
+         +----------+----------+----------+
+         |          |          |          |
+         v          v          v          v
+     +---------+  +-------+  +-------+  +-------+
+     |   BTB   |  | Bimod |  | 2Lev  |  | Meta  |
+     | (Target)|  | Table |  | Table |  | Table |
+     +---------+  +-------+  +-------+  +-------+
+         |            |          |          |
+         |            v          v          |
+         |        +--------+--------+       |
+         |        |                 |       |
+         |     Bimod    2-Level     |       |
+         |     Pred     Pred        |       |
+         |        |        |        |       |
+         |        +---+----+        |       |
+         |            |             |       |
+         |            v             v       v
+         |        +-------+     +--------+--------+
+         |        | Which |<----|  Meta Counter  |
+         |        | Pred? |     +--------+--------+
+         |        +-------+              |
+         |            |                  |
+         |            |     if meta >= 2: use 2-level
+         |            |     if meta <  2: use bimodal
+         |            v
+         |     Final Direction
+         |        Prediction
+         |            |
+         |            v
+         |        Taken or
+         |        Not Taken?
+         |            |
+         +------------+
+                  |
+                  v
+           Final Prediction:
+           - If Not Taken: return 0
+           - If Taken && BTB hit: return target
+           - If Taken && BTB miss: return 1
+
+
+================================================================================
+                    TYPICAL PREDICTOR INDICES/HASHING
+================================================================================
+
+BIMODAL (BPred2bit):
+    index = ((addr >> 19) ^ (addr >> MD_BR_SHIFT)) & (size - 1)
+
+2-LEVEL (BPred2Level):
+    L1 index = (addr >> MD_BR_SHIFT) & (l1size - 1)
+    history = shiftregs[L1_index]
+    
+    if (XOR):
+        L2_index = ((history ^ (addr >> MD_BR_SHIFT)) & ((1 << shift_width) - 1))
+                   | ((addr >> MD_BR_SHIFT) << shift_width)
+    else:
+        L2_index = history | ((addr >> MD_BR_SHIFT) << shift_width)
+    
+    L2_index = L2_index & (l2size - 1)
+
+BTB:
+    set = (addr >> MD_BR_SHIFT) & (btb_sets - 1)
+    then search within associative set
+
+
+================================================================================
+                    YOUR BPREDNEIL IMPLEMENTATION POINTS
+================================================================================
+
+1. In bpred_create():
+   - case BPredNeil:
+   - Call bpred_dir_create() for your custom predictor
+   - BTB and RAS will be created automatically
+
+2. In bpred_dir_create():
+   - case BPredNeil:
+   - Allocate your custom tables/structures
+   - Initialize to starting state
+
+3. In bpred_dir_lookup():
+   - case BPredNeil:
+   - Compute index from address (and history if needed)
+   - Return pointer to counter/weight/state
+
+4. In bpred_lookup():
+   - case BPredNeil:
+   - Call bpred_dir_lookup() to get pointer
+   - Store in dir_update_ptr->pdir1
+   - RAS and BTB handled by common code
+
+5. In bpred_update():
+   - Update your history registers (if any)
+   - Update your counters/weights/state using pointers from dir_update_ptr
+   - BTB update handled by common code
+
+6. In bpred_config() and bpred_dir_config():
+   - Print your predictor configuration
+
+Remember: The key is maintaining state in dir_update_ptr between lookup and update!
+
+================================================================================
